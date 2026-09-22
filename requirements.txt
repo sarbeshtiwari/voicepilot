@@ -1,0 +1,6 @@
+sounddevice>=0.5
+numpy>=1.24
+
+faster-whisper>=1.1
+# openai>=1.30
+# SpeechRecognition>=3.10

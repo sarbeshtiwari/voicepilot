@@ -1,0 +1,78 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test coverage output
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+logs/
+log/
+
+# Local editor settings and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local project data and generated media
+data/
+raw_data/
+datasets/
+models/
+checkpoints/
+cache/
+output/
+results/
+artifacts/
+uploads/
+recordings/
+audio/
+voice/
+transcripts/
+
+# Audio and media files
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.pcm
+
+# Temporary and runtime folders
+.tmp/
+tmp/
+temp/
