@@ -2,9 +2,7 @@
 <#
     voicepilot installer for Windows.
 
-    Solo mode - voice control of the machine - runs natively here.
-    Wrapping a terminal AI agent needs a Unix pty (pty/termios/fcntl), which
-    Windows does not have; use WSL for that and run install.sh inside it.
+    Solo mode and agent mode run natively. Agent mode uses Windows ConPTY.
 
     Usage:  powershell -ExecutionPolicy Bypass -File install.ps1
 #>
@@ -22,7 +20,15 @@ $pyArgs = @()
 
 if (Get-Command py -ErrorAction SilentlyContinue) {
     foreach ($v in '3.12', '3.13', '3.11', '3.10') {
-        & py "-$v" -c "import sys" 2>$null | Out-Null
+        # Windows PowerShell 5.1 turns native stderr into a terminating error
+        # under Stop. A missing version is expected while probing the launcher.
+        $probePreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & py "-$v" -c "import sys" 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $probePreference
+        }
         if ($LASTEXITCODE -eq 0) {
             $pyExe = 'py'; $pyArgs = @("-$v"); break
         }
@@ -40,15 +46,16 @@ if (-not $pyExe) {
 Write-Host "==> interpreter: $pyExe $pyArgs"
 
 # --- 2. build the venv ------------------------------------------------------
-if (Test-Path .venv) { Remove-Item -Recurse -Force .venv }
-& $pyExe @pyArgs -m venv .venv
+$venvDir = Join-Path $Here '.venv-win'
+& $pyExe @pyArgs -m venv $venvDir
 if ($LASTEXITCODE -ne 0) { throw "could not create the virtual environment" }
 
-$venvPy = Join-Path $Here '.venv\Scripts\python.exe'
+$venvPy = Join-Path $venvDir 'Scripts\python.exe'
 if (-not (Test-Path $venvPy)) { throw "venv created but $venvPy is missing" }
 
 Write-Host "==> installing dependencies"
 & $venvPy -m pip install --quiet --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
 & $venvPy -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
 
@@ -72,6 +79,6 @@ Write-Host ""
 Write-Host "Done. Verify with:" -ForegroundColor Green
 Write-Host "    voicepilot --check"
 Write-Host "    voicepilot solo"
+Write-Host "    voicepilot codex"
 Write-Host ""
-Write-Host "Note: wrapping an AI agent (voicepilot claude) needs a Unix pty and"
-Write-Host "does not run on native Windows. Use WSL for that."
+Write-Host "Agent mode uses Windows ConPTY; WSL is optional."

@@ -1,4 +1,4 @@
-#!/Users/apple/Desktop/voicepilot/.venv/bin/python
+#!/usr/bin/env python3
 """
 voicepilot - talk to any terminal AI agent by voice.
 
@@ -26,6 +26,8 @@ Keys while running:
 from __future__ import annotations
 
 import argparse
+import codecs
+import getpass
 import os
 import queue
 import re
@@ -92,7 +94,7 @@ PROMPT_PATTERNS = (
 # defaults, which are deliberately conservative rather than Claude-specific.
 AGENT_PROFILES = {
     "claude":   {"idle": 2.5},
-    "codex":    {"idle": 2.5},
+    "codex":    {"idle": 2.5, "submit_delay": 1.0},
     "crush":    {"idle": 2.5},
     "opencode": {"idle": 2.5},
     "kimi":     {"idle": 2.5},
@@ -387,7 +389,12 @@ def enable_windows_ansi() -> None:
         return
     try:
         import ctypes
+        from ctypes import wintypes
         kernel = ctypes.windll.kernel32
+        kernel.GetStdHandle.restype = wintypes.HANDLE
+        kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.SetConsoleOutputCP(65001)
         for std in (-11, -12):                     # stdout, stderr
             handle = kernel.GetStdHandle(std)
             mode = ctypes.c_uint32()
@@ -520,8 +527,22 @@ class Recorder:
     def __init__(self, samplerate: int = 16000, device=None,
                  threshold: float | None = None):
         self.samplerate = samplerate
-        self.device = device
+        # argparse supplies strings; sounddevice treats '1' as a device NAME.
+        self.device = int(device) if isinstance(device, str) and device.isdecimal() else device
         self.threshold = threshold
+
+    def input_samplerate(self) -> int:
+        """Use the mic's native rate when its driver rejects 16 kHz."""
+        import sounddevice as sd
+        try:
+            sd.check_input_settings(device=self.device, channels=1,
+                                    dtype="int16", samplerate=self.samplerate)
+            return self.samplerate
+        except sd.PortAudioError:
+            rate = int(sd.query_devices(self.device, "input")["default_samplerate"])
+            sd.check_input_settings(device=self.device, channels=1,
+                                    dtype="int16", samplerate=rate)
+            return rate
 
     @staticmethod
     def available() -> bool:
@@ -539,9 +560,10 @@ class Recorder:
         import numpy as np
         import sounddevice as sd
 
+        samplerate = self.input_samplerate()
         frame_ms = 30
-        blocksize = int(self.samplerate * frame_ms / 1000)
-        frame_s = blocksize / self.samplerate
+        blocksize = int(samplerate * frame_ms / 1000)
+        frame_s = blocksize / samplerate
 
         q: queue.Queue[bytes] = queue.Queue()
 
@@ -555,9 +577,10 @@ class Recorder:
         silence_run = 0.0
         total = 0.0
         t0 = time.time()
+        last_frame = time.monotonic()
         thresh = self.threshold or self.MIN_THRESHOLD
 
-        with sd.RawInputStream(samplerate=self.samplerate, blocksize=blocksize,
+        with sd.RawInputStream(samplerate=samplerate, blocksize=blocksize,
                                dtype="int16", channels=1, device=self.device,
                                callback=cb):
             while True:
@@ -566,10 +589,13 @@ class Recorder:
                 try:
                     buf = q.get(timeout=0.25)
                 except queue.Empty:
+                    if time.monotonic() - last_frame > 5.0:
+                        raise RuntimeError("microphone stopped delivering audio; check the input device and permissions")
                     if not started and time.time() - t0 > max_wait:
                         return None
                     continue
 
+                last_frame = time.monotonic()
                 arr = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
                 rms = float(np.sqrt(np.mean(arr * arr))) if arr.size else 0.0
 
@@ -609,7 +635,7 @@ class Recorder:
         with wave.open(path, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
-            w.setframerate(self.samplerate)
+            w.setframerate(samplerate)
             w.writeframes(b"".join(frames))
         return path
 
@@ -786,6 +812,7 @@ class Session:
         self.profile = prof
 
         self.master_fd = -1
+        self.windows_terminal = None
         self.pid = -1
         self.alive = True
         self.exit_status: int | None = None
@@ -800,6 +827,14 @@ class Session:
         self.user_typed = False               # user is composing, stay out of it
         self.frames: deque = deque(maxlen=400)  # (ts, text) of recent output
         self.screen = Screen()
+        self._output_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        if re.sub(r"\.(exe|cmd|bat|ps1)$", "", os.path.basename(argv[0]).lower()) == "codex":
+            try:
+                from codex_screen import CodexScreen
+                size = shutil.get_terminal_size((100, 30))
+                self.screen = CodexScreen(size.columns, size.lines)
+            except ImportError:
+                pass
         self.reply_head = ""      # what we just read out
         self.reply_tail = ""      # what "read more" would continue with
         self.started_at = time.time()
@@ -819,6 +854,8 @@ class Session:
         write approximates what is on screen now. Matching the whole scrollback
         instead would keep hitting stale text the agent has already erased.
         """
+        if getattr(self.screen, "uses_ansi", False):
+            return "\n".join(self.screen.tail_lines(30))[-4000:]
         if not self.frames:
             return ""
         cutoff = self.frames[-1][0] - window
@@ -830,13 +867,35 @@ class Session:
                         f"{' + enter' if submit else ''} into the agent")
         with self.lock:
             self.screen.mark(text)
-            write_all(self.master_fd, text.encode())
+            data = text.encode()
+            if getattr(self.screen, "uses_ansi", False):
+                # Codex batches rapid keystrokes as a paste. Explicit boundaries
+                # keep Enter from being swallowed by that paste-detection window.
+                data = b"\x1b[200~" + data + b"\x1b[201~"
+            self._write(data)
             if submit:
                 time.sleep(self.a.submit_delay)
-                write_all(self.master_fd, self.a.submit_key.encode())
+                self._write(self.a.submit_key.encode())
+                if getattr(self.screen, "uses_ansi", False):
+                    time.sleep(0.8)
+                    # A busy ConPTY can defer the paste event. Retry Enter only
+                    # if the exact dictated text still occupies the composer;
+                    # never press it on a permission dialog or a running task.
+                    if self.screen.input_text() == " ".join(text.split()):
+                        self._write(self.a.submit_key.encode())
+            # The old response can still be visible until the agent redraws.
+            # Give the new request a full idle interval before considering it done.
+            self.last_output = time.time()
+            self.announced = False
 
     def send_raw(self, data: bytes) -> None:
         with self.lock:
+            self._write(data)
+
+    def _write(self, data: bytes) -> None:
+        if self.windows_terminal is not None:
+            self.windows_terminal.write(data)
+        else:
             write_all(self.master_fd, data)
 
     # -- the voice turn ---------------------------------------------------
@@ -1011,6 +1070,11 @@ class Session:
         try:
             s = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
             fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, s)
+            if hasattr(self.screen, "resize"):
+                import struct
+                rows, columns, _, _ = struct.unpack("HHHH", s)
+                if rows and columns:
+                    self.screen.resize(columns, rows)
         except OSError:
             pass
 
@@ -1043,7 +1107,8 @@ class Session:
         write_all(1, chunk)
         text = visible(chunk)
         # pure cursor moves / redraws don't count as the agent "working"
-        self.screen.feed(text)
+        self.screen.feed(self._output_decoder.decode(chunk)
+                         if getattr(self.screen, "uses_ansi", False) else text)
         if text.strip():
             self.last_output = time.time()
             self.frames.append((self.last_output, text))
@@ -1058,6 +1123,13 @@ class Session:
         now = time.time()
         if now - self.started_at < self.a.startup_grace:
             return False
+        if getattr(self.screen, "uses_ansi", False):
+            approval = bool(APPROVAL_RE.search(self.recent_text()))
+            if not approval:
+                if not self.screen.at_prompt():
+                    return False
+                if self.screen.marked and not self.screen.reply():
+                    return False
         low = self.recent_text()[-800:].lower()
         quiet = now - self.last_output
         if self.screen.at_prompt():
@@ -1094,6 +1166,57 @@ class Session:
 
     # -- main loop --------------------------------------------------------
 
+    def _run_windows(self) -> int:
+        from windows_terminal import WindowsTerminal, WindowsInput
+        size = shutil.get_terminal_size((100, 30))
+        try:
+            terminal = WindowsTerminal(self.argv, size.columns, size.lines)
+        except Exception as e:
+            status(f"could not start agent: {e}")
+            return 127
+        self.windows_terminal = terminal
+        self.pid = terminal.pty.pid
+        status(f"{GRN}{self.a.name} on{RST} - {' '.join(self.argv)} "
+               "[Windows ConPTY] Ctrl-] talk, Ctrl-\\ toggle")
+        ended_at = None
+        try:
+            with WindowsInput() as keyboard:
+                while self.alive:
+                    try:
+                        chunk = terminal.read()
+                    except EOFError:
+                        chunk = ""
+                    if chunk:
+                        self._handle_output(chunk.encode("utf-8"))
+                    if not terminal.isalive():
+                        # ConPTY may deliver its final output after child exit.
+                        if ended_at is None or chunk:
+                            ended_at = time.monotonic()
+                        if time.monotonic() - ended_at > 0.3:
+                            break
+                    else:
+                        data = keyboard.read()
+                        if data:
+                            self._handle_stdin(data)
+                        new_size = shutil.get_terminal_size((100, 30))
+                        if new_size != size:
+                            terminal.resize(new_size.columns, new_size.lines)
+                            if hasattr(self.screen, "resize"):
+                                self.screen.resize(new_size.columns, new_size.lines)
+                            size = new_size
+                        if self._should_announce():
+                            self.start_voice_turn("idle")
+                    time.sleep(0.02)
+        finally:
+            self.alive = False
+            self.cancel.set()
+            self.speaker.stop()
+            self.exit_status = terminal.exit_code()
+            terminal.close()
+            self.windows_terminal = None
+            status(f"session ended - {self.turns} spoken prompt(s) sent")
+        return self.exit_status if self.exit_status is not None else 0
+
     def run(self) -> int:
         if not sys.stdin.isatty():
             print("voicepilot needs an interactive terminal.", file=sys.stderr)
@@ -1105,6 +1228,9 @@ class Session:
                 self.stt.warm()
             except Exception as e:
                 status(f"{YEL}model load failed: {e}{RST}")
+
+        if os.name == "nt":
+            return self._run_windows()
 
         old = termios.tcgetattr(0)
         self.pid, self.master_fd = pty.fork()
@@ -1179,7 +1305,7 @@ class Session:
                     if self.exit_status is not None else 0)
             print(f"\n{DIM}[voice] session ended - {self.turns} spoken "
                   f"prompt(s) sent{RST}")
-            return code
+        return code
 
 
 # ------------------------------------------------------------------ desktop --
@@ -1788,7 +1914,7 @@ class Desktop:
         else:
             cmd = {"shutdown": ["systemctl", "poweroff"],
                    "restart": ["systemctl", "reboot"],
-                   "logout": ["loginctl", "terminate-user", os.getlogin()]}[action]
+                   "logout": ["loginctl", "terminate-user", getpass.getuser()]}[action]
             self._sh(cmd)
         return f"{action.capitalize()} now"
 
@@ -2264,11 +2390,12 @@ def run_check(args) -> int:
     print(f"text-to-speech : {sp.backend}")
     if sp.available:
         sp.say("Voice pilot check. Speak after the prompt.")
-    else:
+    elif not args.no_speak:
         ok = False
         print("   -> install espeak-ng, or: pip install pyttsx3")
 
     mic = Recorder.available()
+    mic_ready = False
     print(f"microphone     : {'sounddevice ok' if mic else 'MISSING'}")
     if not mic:
         ok = False
@@ -2279,23 +2406,41 @@ def run_check(args) -> int:
         try:
             import numpy as np
             import sounddevice as sd
-            d = sd.rec(int(1.0 * 16000), samplerate=16000, channels=1,
-                       dtype="int16", device=args.mic_device)
-            sd.wait()
+            recorder = Recorder(device=args.mic_device)
+            rate = recorder.input_samplerate()
+            device_label = 'default' if recorder.device is None else recorder.device
+            print(f"   -> input device {device_label}, {rate} Hz", flush=True)
+            d = sd.rec(rate, samplerate=rate, channels=1,
+                       dtype="int16", device=recorder.device)
+            deadline = time.monotonic() + 5.0
+            try:
+                while sd.get_stream().active:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("microphone delivered no complete recording within 5 seconds")
+                    time.sleep(0.05)
+            finally:
+                sd.stop()
             rms = float(np.sqrt(np.mean(d.astype(np.float32) ** 2)))
             if rms < 1.0:
                 ok = False
                 print(f"   -> capturing digital silence (rms {rms:.1f}): "
-                      "your terminal has no microphone permission")
+                      "check mute, input device, and microphone permissions")
                 if sys.platform == "darwin":
                     print("      System Settings > Privacy & Security > "
                           "Microphone > enable your terminal app, then restart it")
             else:
+                mic_ready = True
                 print(f"   -> room tone rms {rms:.0f}, speech must exceed "
                       f"{max(Recorder.MIN_THRESHOLD, rms * 3.5):.0f}")
         except Exception as e:
             ok = False
             print(f"   -> could not open the mic: {e}")
+        if not mic_ready:
+            print("   -> list inputs with: python -m sounddevice; select one with --mic-device INDEX")
+            if sys.platform.startswith("win"):
+                print("   -> Windows Settings > Privacy & security > Microphone > allow desktop apps")
+            elif os.environ.get("WSL_DISTRO_NAME"):
+                print("   -> WSL audio needs WSLg/PulseAudio and Windows microphone permission.")
 
     st = Transcriber(args.stt, args.stt_model, args.language, beam=args.beam)
     installed = Transcriber.available_backends()
@@ -2304,7 +2449,7 @@ def run_check(args) -> int:
           f"   (installed: {', '.join(installed) or 'none'})")
     if len(installed) > 1:
         print("   -> run 'voicepilot --compare' to test them on your own voice")
-    if not st.available:
+    if not st.available and args.stt != "none":
         ok = False
         print("   -> pip install faster-whisper      (local, recommended)")
         print("   -> or: pip install openai + export OPENAI_API_KEY=...")
@@ -2328,7 +2473,7 @@ def run_check(args) -> int:
     elif acc:
         print("   -> accessibility granted (clicks and typing will work)")
 
-    if mic and st.available:
+    if mic_ready and st.available:
         print("\nloading model...")
         st.warm()
         print("say something now (recording stops on silence)...")
@@ -2347,7 +2492,8 @@ def run_check(args) -> int:
             finally:
                 os.unlink(wav)
 
-    print("\n" + ("ALL GOOD - run:  voicepilot.py claude" if ok
+    next_command = "voicepilot solo" if not HAVE_PTY else "voicepilot claude"
+    print("\n" + (f"ALL GOOD - run:  {next_command}" if ok
                   else "fix the items above, then re-run --check"))
     return 0 if ok else 1
 
@@ -2527,7 +2673,13 @@ def main() -> int:
     if not argv:
         p.print_help()
         return 2
-    if not HAVE_PTY:
+    if not HAVE_PTY and os.name == "nt":
+        try:
+            import winpty
+        except ImportError:
+            print("Windows agent mode needs pywinpty. Re-run install.ps1.", file=sys.stderr)
+            return 2
+    elif not HAVE_PTY:
         print("Wrapping an agent needs a Unix pty - run this under WSL.\n"
               "Solo voice control does work here: voicepilot --solo",
               file=sys.stderr)

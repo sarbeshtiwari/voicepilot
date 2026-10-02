@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Set voicepilot up on a fresh machine: build a venv with a Python that has
-# wheels, install deps, point the shebang at it, and put it on PATH.
+# wheels, install deps, and put a launcher on PATH.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
+VENV="$HERE/.venv"
+if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+  VENV="$HERE/.venv-wsl"
+fi
 
 case "$(uname -s)" in
   Darwin|Linux) ;;
@@ -36,16 +40,15 @@ fi
 echo "==> interpreter: $PY ($("$PY" -V 2>&1))"
 
 # --- 2. build the venv ------------------------------------------------------
-rm -rf .venv
 if command -v uv >/dev/null 2>&1; then
-  echo "==> creating .venv with uv"
-  uv venv --python "$PY" .venv
-  uv pip install --python .venv/bin/python -r requirements.txt
+  echo "==> using $VENV with uv"
+  [ -x "$VENV/bin/python" ] || uv venv --python "$PY" "$VENV"
+  uv pip install --python "$VENV/bin/python" -r requirements.txt
 else
-  echo "==> creating .venv with venv/pip"
-  "$PY" -m venv .venv
-  ./.venv/bin/python -m pip install --quiet --upgrade pip
-  ./.venv/bin/python -m pip install -r requirements.txt
+  echo "==> using $VENV with venv/pip"
+  [ -x "$VENV/bin/python" ] || "$PY" -m venv "$VENV"
+  "$VENV/bin/python" -m pip install --quiet --upgrade pip
+  "$VENV/bin/python" -m pip install -r requirements.txt
 fi
 
 # --- 2b. optional Apple Silicon speech engines -----------------------------
@@ -55,9 +58,9 @@ if [ "${1:-}" = "--mlx" ]; then
   if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
     echo "==> installing parakeet-mlx + mlx-whisper (large download)"
     if command -v uv >/dev/null 2>&1; then
-      uv pip install --python .venv/bin/python parakeet-mlx mlx-whisper
+      uv pip install --python "$VENV/bin/python" parakeet-mlx mlx-whisper
     else
-      ./.venv/bin/python -m pip install parakeet-mlx mlx-whisper
+      "$VENV/bin/python" -m pip install parakeet-mlx mlx-whisper
     fi
   else
     echo "==> --mlx needs Apple Silicon; skipping"
@@ -66,14 +69,13 @@ elif [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
   echo "==> tip: ./install.sh --mlx adds faster, more accurate speech engines"
 fi
 
-# --- 3. make the script self-contained -------------------------------------
-# -i.bak keeps this working on both BSD sed (macOS) and GNU sed (Linux)
-sed -i.bak "1s|.*|#!$HERE/.venv/bin/python|" voicepilot.py
-rm -f voicepilot.py.bak
-chmod +x voicepilot.py
-
+# --- 3. launcher (also works when the project path contains spaces) ---------
 mkdir -p "$HOME/.local/bin"
-ln -sf "$HERE/voicepilot.py" "$HOME/.local/bin/voicepilot"
+# Replace the old symlink before writing, or it would overwrite the source.
+rm -f "$HOME/.local/bin/voicepilot"
+printf '#!/usr/bin/env bash\nexec %q %q "$@"\n' \
+  "$VENV/bin/python" "$HERE/voicepilot.py" > "$HOME/.local/bin/voicepilot"
+chmod +x "$HOME/.local/bin/voicepilot"
 echo "==> installed: $HOME/.local/bin/voicepilot"
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
@@ -85,7 +87,7 @@ if [ "$(uname -s)" = "Linux" ]; then
   command -v espeak-ng >/dev/null 2>&1 || command -v spd-say >/dev/null 2>&1 || {
     echo "==> no speech synthesiser found, install one:"
     echo "    sudo apt install espeak-ng      # or: sudo dnf install espeak-ng"; }
-  ./.venv/bin/python -c "import sounddevice" 2>/dev/null || {
+  "$VENV/bin/python" -c "import sounddevice" 2>/dev/null || {
     echo "==> PortAudio missing:  sudo apt install libportaudio2"; }
 fi
 

@@ -232,8 +232,7 @@ presses do**, and that is separate from the microphone:
   your terminal app. `voicepilot --check` reports whether this is granted.
 - **Linux** — needs `xdotool`; `wmctrl` for window focus, `playerctl` for
   media, `brightnessctl` for brightness, `xclip` for the clipboard.
-- **Windows** — works natively, unlike agent mode, since solo mode drives the
-  desktop rather than a pty.
+- **Windows** — solo mode drives the desktop natively; agent mode uses ConPTY.
 
 Solo mode adds no dependencies: CoreGraphics via `ctypes` plus `osascript` on
 macOS, `user32` on Windows, `xdotool` on Linux.
@@ -320,7 +319,8 @@ voicepilot --stt faster-whisper --stt-model medium.en --save
 
 # Install on another machine
 
-Copy **`voicepilot.py`, `requirements.txt`, `install.sh`, `README.md`** and run
+Copy **`voicepilot.py`, `windows_terminal.py`, `codex_screen.py`,
+`requirements.txt`, `install.sh`, `install.ps1`, `README.md`** and run
 the installer. **Do not copy `.venv`** — it hard-codes paths from the old
 machine.
 
@@ -331,15 +331,15 @@ voicepilot --check
 ```
 
 `install.sh` picks a Python that has wheels (3.12 first, since compiled deps
-like `ctranslate2` lag behind new releases), builds `.venv`, rewrites the
-script's shebang to it, and symlinks `voicepilot` into `~/.local/bin`. It uses
+like `ctranslate2` lag behind new releases), builds `.venv` (`.venv-wsl` in WSL),
+and writes a launcher into `~/.local/bin`. It uses
 `uv` if present, otherwise `venv` + `pip`.
 
 | OS | Notes |
 |---|---|
 | **macOS** | Works as-is. TTS is the built-in `say`. |
 | **Linux** | Also `sudo apt install espeak-ng libportaudio2 xdotool`. |
-| **Windows** | See below — native Windows runs solo mode only. |
+| **Windows** | See below — both solo and agent modes run natively. |
 
 ### Windows
 
@@ -350,24 +350,71 @@ installer, from the voicepilot folder:
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-It builds `.venv` with the Windows layout (`Scripts\`, not `bin/`), installs a
+It builds `.venv-win` with the Windows layout (`Scripts\`, not `bin/`), installs a
 `voicepilot.cmd` launcher under `%LOCALAPPDATA%\voicepilot`, and adds that to
 your PATH — **open a new terminal** afterwards. Then:
 
 ```
 voicepilot --check
 voicepilot solo
+voicepilot codex
 ```
 
-Native Windows runs **solo mode only**. Wrapping an AI agent needs a Unix
-pseudo-terminal, which Windows has no equivalent for — for that, install WSL
-and run `./install.sh` inside it, where everything works.
+Native Windows supports agent mode through **ConPTY**, installed via `pywinpty`.
+Run `voicepilot codex` in PowerShell or Windows Terminal; WSL is not required.
+Codex's terminal repaints are reconstructed before VoicePilot extracts its final
+answer. To use a Linux-installed agent instead, install and run inside WSL:
+
+```bash
+cd /mnt/d/self-ai/voicepilot/voicepilot  # adjust to your checkout
+bash install.sh
+~/.local/bin/voicepilot --check
+~/.local/bin/voicepilot claude
+```
+
+Windows and WSL now use separate environments, so installing one preserves the
+other. Existing `.venv` directories are left intact. Shell scripts are checked
+out with LF endings to avoid `pipefail` / `bash\r` errors in WSL.
+
+WSL microphone access depends on the [WSLg audio bridge](https://github.com/microsoft/wslg).
+If `--check` reports a recording timeout, check Windows microphone permissions
+and WSLg audio; reinstalling Python dependencies will not repair a stalled bridge.
+Native Windows solo mode uses the microphone directly.
+List audio devices using the appropriate environment:
+
+```powershell
+.\.venv-win\Scripts\python.exe -m sounddevice
+voicepilot --mic-device 1 --check  # replace 1 with your input device index
+```
+
+Inside WSL, use `.venv-wsl/bin/python -m sounddevice`. Numeric microphone IDs
+are supported, and recording falls back to the device's native sample rate
+when its driver cannot capture at 16 kHz.
+
+### Record a Windows demo with Codex
+
+The optional recording tools run a real Codex session in an isolated fixture.
+Synthesized prompt WAVs replace the microphone; they pass through the normal
+local speech recognizer and VoicePilot turn loop. The resulting MP4 is a replay
+of recorded terminal output, with synthesized speech labeled and long waits
+shortened. It is not a live microphone or desktop screen recording.
+
+```powershell
+.\.venv-win\Scripts\python.exe -m pip install -r tools/demo-requirements.txt
+.\.venv-win\Scripts\python.exe tools/capture_demo.py --output artifacts/my-demo
+.\.venv-win\Scripts\python.exe tools/render_demo.py --input artifacts/my-demo
+```
+
+Requires a signed-in Codex CLI and the Windows David/Zira speech voices. The
+capture script preserves earlier recordings; choose a new output folder for
+each take. Output includes the MP4, a preview PNG, original speech WAVs, the
+timestamped terminal log, and the actual code edited by Codex.
 
 # Setup notes
 
-Dependencies live in `.venv` next to the script (Python 3.12 — `faster-whisper`
-has no wheels for 3.14). The shebang points at that venv, so the script just
-runs.
+Dependencies live next to the script in `.venv`, `.venv-win`, or `.venv-wsl`.
+The installed launcher selects the correct interpreter. Python 3.12 is preferred;
+availability of compiled dependency wheels varies with Python and platform.
 
 **Microphone permission:** macOS silently returns all-zero audio when the
 terminal lacks mic access. `--check` detects exactly that.

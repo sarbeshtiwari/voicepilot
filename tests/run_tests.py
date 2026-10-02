@@ -3,7 +3,11 @@
 
 No test framework, to match the project's zero-dependency policy.
 """
-import importlib.util, os, pty, re, select, sys, time
+import importlib.util, os, re, select, sys, time
+try:
+    import pty
+except ImportError:
+    pty = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -181,13 +185,14 @@ def heard(utterance):
 
 
 MOD = ("command",)
+SHORTCUT_MOD = ("command",) if solo.desk.os == "mac" else ("control",)
 for utterance, want in [
     ("computer open safari",               ("open_app", ("safari",), {})),
     ("computer click",                     ("click", ("left",), {})),
     ("computer double click",              ("click", ("left", 2), {})),
     ("computer type hello there",          ("type_text", ("hello there",), {})),
     ("computer press command s",           ("press", ("s", MOD), {})),
-    ("computer copy",                      ("press", ("c", MOD), {})),
+    ("computer copy",                      ("press", ("c", SHORTCUT_MOD), {})),
     ("computer scroll down",               ("scroll", ("down", 5), {})),
     ("computer move the cursor left 200",  ("move_by", ("left", 200), {})),
     ("computer volume up",                 ("volume", ("up",), {})),
@@ -195,7 +200,7 @@ for utterance, want in [
     ("computer open downloads",            ("open_path", ("downloads",), {})),
     ("computer go to github dot com",      ("open_url", ("github dot com",), {})),
     ("computer close window",              ("window", ("close",), {})),
-    ("computer close tab",                 ("press", ("w", MOD), {})),
+    ("computer close tab",                 ("press", ("w", SHORTCUT_MOD), {})),
     ("computer quit spotify",              ("quit_app", ("spotify",), {})),
     ("computer switch to chrome",          ("focus_app", ("chrome",), {})),
     ("computer minimize",                  ("window", ("minimize",), {})),
@@ -403,33 +408,34 @@ def agent_loop():
     return out.decode("utf-8", "ignore")
 
 
-txt = agent_loop()
-spoke = [l.split("[SPOKE] ", 1)[1].strip()
-         for l in txt.splitlines() if "[SPOKE] " in l]
-check("reads the agent's real reply aloud",
-      any("refactored the login handler" in l for l in spoke), str(spoke))
-check("no generic 'Task complete' over a real reply",
-      not any(l.startswith("Task complete") for l in spoke), str(spoke))
-check("a reply ending in a question omits the follow-up",
-      any(l.rstrip().endswith("Which environment should I deploy to?")
-          for l in spoke), str(spoke))
-check("a non-question reply gets the follow-up",
-      any("tests pass" in l and l.rstrip().endswith("What's next?") for l in spoke),
-      str(spoke))
-check("'repeat' re-speaks it",
-      sum("refactored the login handler" in l for l in spoke) >= 2)
-check("'repeat' is never sent to the agent", "unknown task repeat" not in txt)
-check("the agent received both tasks",
-      "refactored" in txt and "tests pass" in txt)
-check("your own prompt is not read back",
-      not any(l.strip() in ("first task", "second task") for l in spoke))
+if pty is not None:
+    txt = agent_loop()
+    spoke = [l.split("[SPOKE] ", 1)[1].strip()
+             for l in txt.splitlines() if "[SPOKE] " in l]
+    check("reads the agent's real reply aloud",
+          any("refactored the login handler" in l for l in spoke), str(spoke))
+    check("no generic 'Task complete' over a real reply",
+          not any(l.startswith("Task complete") for l in spoke), str(spoke))
+    check("a reply ending in a question omits the follow-up",
+          any(l.rstrip().endswith("Which environment should I deploy to?")
+              for l in spoke), str(spoke))
+    check("a non-question reply gets the follow-up",
+          any("tests pass" in l and l.rstrip().endswith("What's next?") for l in spoke),
+          str(spoke))
+    check("'repeat' re-speaks it",
+          sum("refactored the login handler" in l for l in spoke) >= 2)
+    check("'repeat' is never sent to the agent", "unknown task repeat" not in txt)
+    check("the agent received both tasks",
+          "refactored" in txt and "tests pass" in txt)
+    check("your own prompt is not read back",
+          not any(l.strip() in ("first task", "second task") for l in spoke))
 
 
 def exit_code_case():
     pid, fd = pty.fork()
     if pid == 0:
-        os.execv(os.path.join(ROOT, "voicepilot.py"),
-                 ["voicepilot", "--manual", "--no-speak", "--stt", "none",
+        os.execv(sys.executable,
+                 [sys.executable, os.path.join(ROOT, "voicepilot.py"), "--manual", "--no-speak", "--stt", "none",
                   "/bin/sh", "-c", "echo FINAL-LINE; exit 42"])
     out, status = b"", None
     deadline = time.time() + 20
@@ -452,9 +458,12 @@ def exit_code_case():
     return out.decode("utf-8", "ignore"), os.waitstatus_to_exitcode(status)
 
 
-text, code = exit_code_case()
-check("final output before exit is not dropped", "FINAL-LINE" in text)
-check("the agent's exit code is propagated", code == 42, f"got {code}")
+if pty is not None:
+    text, code = exit_code_case()
+    check("final output before exit is not dropped", "FINAL-LINE" in text)
+    check("the agent's exit code is propagated", code == 42, f"got {code}")
+else:
+    print("SKIP: Unix PTY integration tests require macOS/Linux/WSL")
 
 # ---------------------------------------------------------------- summary
 print(f"\n{'=' * 62}")

@@ -4,6 +4,8 @@ numpy>=1.24               # silence detection
 
 # Speech-to-text - faster-whisper is the cross-platform default.
 faster-whisper>=1.1       # local, no API key, no internet after first run
+pywinpty>=3.0; sys_platform == "win32"  # native Windows agent terminal
+pyte>=0.8                 # reconstruct repainting Codex terminal output
 
 # Better accuracy on Apple Silicon (optional, install both to compare):
 #   parakeet-mlx          # NVIDIA Parakeet on MLX - fast and very accurate for English
