@@ -1,6 +1,18 @@
-sounddevice>=0.5
-numpy>=1.24
+# Core (required for voice input)
+sounddevice>=0.5          # microphone capture
+numpy>=1.24               # silence detection
 
-faster-whisper>=1.1
-# openai>=1.30
-# SpeechRecognition>=3.10
+# Speech-to-text - faster-whisper is the cross-platform default.
+faster-whisper>=1.1       # local, no API key, no internet after first run
+
+# Better accuracy on Apple Silicon (optional, install both to compare):
+#   parakeet-mlx          # NVIDIA Parakeet on MLX - fast and very accurate for English
+#   mlx-whisper           # Whisper large-v3-turbo on MLX - best for accents / noise
+# pip install parakeet-mlx mlx-whisper
+#
+# Other options:
+# openai>=1.30            # cloud STT, needs OPENAI_API_KEY
+# SpeechRecognition>=3.10 # free Google Web Speech, needs internet
+
+# Text-to-speech is built in on macOS (`say`) and Linux (espeak-ng).
+# pyttsx3>=2.90           # only if neither exists (e.g. bare Windows)

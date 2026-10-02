@@ -77,6 +77,53 @@ BUSY_MARKERS = (
     "interrupt)",
 )
 
+# An agent showing its input prompt is a far stronger "it finished" signal
+# than silence alone, and it is what lets this work with agents whose idle
+# screen keeps repainting. Union of the shapes real CLIs draw.
+PROMPT_PATTERNS = (
+    re.compile(r"^\s*[│┃|]\s*[>❯›]"),          # boxed input (claude, codex, crush)
+    re.compile(r"^\s*>>>\s*$"),               # python / ollama repl
+    re.compile(r"^\s*[>❯›#\$]\s*$"),           # bare prompt (aider, shells)
+    re.compile(r"\?\s*for\s+shortcuts"),
+    re.compile(r"^\s*\(.*\)\s*[>❯]\s*$"),     # "(main) >"
+)
+
+# Per-agent tuning, picked from the command name. Unknown agents get the
+# defaults, which are deliberately conservative rather than Claude-specific.
+AGENT_PROFILES = {
+    "claude":   {"idle": 2.5},
+    "codex":    {"idle": 2.5},
+    "crush":    {"idle": 2.5},
+    "opencode": {"idle": 2.5},
+    "kimi":     {"idle": 2.5},
+    "kiro":     {"idle": 2.5},
+    "goose":    {"idle": 2.5},
+    "gemini":   {"idle": 2.5},
+    "cursor-agent": {"idle": 2.5},
+    "aider":    {"idle": 2.0, "submit_key": "\r"},
+    "ollama":   {"idle": 1.5},
+    "llm":      {"idle": 1.5},
+    "python":   {"idle": 1.0},
+    "python3":  {"idle": 1.0},
+    "node":     {"idle": 1.0},
+    "sqlite3":  {"idle": 1.0},
+}
+
+
+def agent_profile(argv: list) -> dict:
+    """Tuning for the command being wrapped, by basename (and subcommand)."""
+    if not argv:
+        return {}
+    base = os.path.basename(argv[0]).lower()
+    base = re.sub(r"\.(exe|cmd|bat|py)$", "", base)
+    if base in AGENT_PROFILES:
+        return AGENT_PROFILES[base]
+    for token in argv[1:3]:                      # e.g. "ollama run llama3"
+        if token.lower() in AGENT_PROFILES:
+            return AGENT_PROFILES[token.lower()]
+    return {}
+
+
 # the agent is blocked on a yes/no or numbered choice
 APPROVAL_RE = re.compile(
     r"(do you want to|allow this|grant .*permission|proceed\?|"
@@ -114,6 +161,10 @@ CHROME_PATTERNS = (
     re.compile(r"^\s*[✻✽✢✳∗*]\s.*\b\d+s\b"),                # "✻ Working for 3s"
     re.compile(r"^\s*(shift\+tab|ctrl\+\w+|alt\+\w+)", re.I),
     re.compile(r"context left|auto-?compact", re.I),
+    re.compile(r"^\s*tokens?:\s|^\s*cost:\s*\$", re.I),      # aider footers
+    re.compile(r"^\s*\d+(\.\d+)?[km]? tokens?\b", re.I),
+    re.compile(r"^\s*(use|type) /\w+ (to|for)\b", re.I),      # hint bars
+    re.compile(r"^\s*[>❯›]{1,3}\s*$"),                        # bare prompt line
 )
 BULLET_RE = re.compile(r"^\s*[●○◍◆▪▸•]\s+")
 
@@ -156,6 +207,17 @@ class Screen:
             else:
                 self.cur += ch
 
+    def tail_lines(self, n: int = 6) -> list:
+        out = list(self.lines)[-n:]
+        if self.cur:
+            out.append(self.cur)
+        return out
+
+    def at_prompt(self) -> bool:
+        """Is the agent visibly showing its input prompt?"""
+        return any(p.search(line) for line in self.tail_lines(6)
+                   for p in PROMPT_PATTERNS)
+
     def mark(self, echo: str = "") -> None:
         """Remember where the next reply starts: just after your prompt.
 
@@ -180,19 +242,31 @@ class Screen:
         """The agent's answer since your last prompt, minus the TUI chrome."""
         out: list = []
         recent: deque = deque(maxlen=60)    # repaints repeat whole lines
+        dropped: list = []
         for raw in self._since_mark():
             line = raw.rstrip()
             if not line.strip():
                 continue
             if any(p.search(line) for p in CHROME_PATTERNS):
+                dropped.append(("chrome", line))
                 continue
             if self.echo and line.strip() == self.echo:
+                dropped.append(("your own prompt", line))
                 continue
             line = BULLET_RE.sub("", line).strip()
-            if not line or line in recent:
+            if not line:
+                continue
+            if line in recent:
+                dropped.append(("repaint duplicate", line))
                 continue
             recent.append(line)
             out.append(line)
+        if TRACE:
+            TRACE("extract", f"{len(out)} line(s) kept, {len(dropped)} dropped")
+            for why, line in dropped[:6]:
+                TRACE("  drop", f"{why:18} | {line[:56]}")
+            for line in out[:6]:
+                TRACE("  keep", f"{'':18} | {line[:56]}")
         return "\n".join(out)
 
 
@@ -215,6 +289,8 @@ def speakable(text: str, limit: int) -> tuple:
         cut = limit
     return text[:cut + 1].strip(), text[cut + 1:].strip()
 
+
+__version__ = "1.0"
 
 CONFIG_PATH = os.path.expanduser("~/.config/voicepilot/config.json")
 
@@ -272,6 +348,53 @@ def personalize(text: str, name: str, user: str) -> str:
     out = re.sub(r",\s*([.?!,])", r"\1", out)
     out = re.sub(r"\s+([.?!,])", r"\1", out)
     return re.sub(r"\s{2,}", " ", out).strip()
+
+
+CYA = "\x1b[36m"
+MAG = "\x1b[35m"
+
+
+class Trace:
+    """Live commentary on the decisions voicepilot is making.
+
+    Writes to stderr so it can be redirected away from the agent's TUI:
+        voicepilot --trace claude 2> trace.log
+    """
+
+    def __init__(self, enabled: bool = False):
+        self.on = enabled
+        self.t0 = time.time()
+
+    def __bool__(self) -> bool:
+        return self.on
+
+    def __call__(self, tag: str, msg: str) -> None:
+        if not self.on:
+            return
+        try:
+            os.write(2, f"\r\n{CYA}{time.time() - self.t0:7.2f}s "
+                        f"{MAG}{tag:<9}{RST} {msg}\r\n".encode())
+        except OSError:
+            pass
+
+
+TRACE = Trace(False)
+
+
+def enable_windows_ansi() -> None:
+    """Legacy Windows consoles print escape codes literally; opt into VT."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        for std in (-11, -12):                     # stdout, stderr
+            handle = kernel.GetStdHandle(std)
+            mode = ctypes.c_uint32()
+            if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass                                       # cosmetic only
 
 
 def status(msg: str) -> None:
@@ -462,6 +585,8 @@ class Recorder:
                         started = True
                         frames.extend(preroll)
                         total = len(preroll) * frame_s
+                        TRACE("mic", f"speech starts: level {rms:.0f} > "
+                                     f"threshold {thresh:.0f}")
                         if on_speech_start:
                             on_speech_start()
                     elif time.time() - t0 > max_wait:
@@ -471,8 +596,11 @@ class Recorder:
                     total += frame_s
                     silence_run = 0.0 if rms > thresh * 0.65 else silence_run + frame_s
                     if total >= min_len and silence_run >= silence:
+                        TRACE("mic", f"{silence_run:.1f}s of silence ends it: "
+                                     f"{total:.1f}s captured")
                         break
                     if total >= max_len:
+                        TRACE("mic", f"hit the {max_len}s cap")
                         break
 
         if not frames:
@@ -491,12 +619,42 @@ class Recorder:
 class Transcriber:
     """Speech to text. Local faster-whisper first, cloud/Google as fallbacks."""
 
+    # bigger is more accurate and slower; these are the sane rungs
+    LADDER = ("tiny.en", "base.en", "small.en", "medium.en", "large-v3")
+    MLX_DEFAULT = "mlx-community/whisper-large-v3-turbo"
+    PARAKEET_DEFAULT = "mlx-community/parakeet-tdt-0.6b-v2"
+
     def __init__(self, backend: str = "auto", model: str | None = None,
-                 language: str | None = "en"):
+                 language: str | None = "en", beam: int = 5,
+                 bias: str | None = None):
         self.model_name = model
         self.language = language
+        self.beam = beam
+        # a hint of the expected vocabulary; only safe for a closed command
+        # set, since it biases the decoder toward these words
+        self.bias = bias
         self.backend = self._detect() if backend == "auto" else backend
         self._model = None
+
+    @staticmethod
+    def available_backends() -> list:
+        found = []
+        for mod, name in (("faster_whisper", "faster-whisper"),
+                          ("parakeet_mlx", "parakeet-mlx"),
+                          ("mlx_whisper", "mlx-whisper"),
+                          ("whisper", "whisper")):
+            try:
+                __import__(mod)
+                found.append(name)
+            except Exception:
+                pass
+        if os.environ.get("OPENAI_API_KEY"):
+            try:
+                __import__("openai")
+                found.append("openai")
+            except Exception:
+                pass
+        return found
 
     @staticmethod
     def _detect() -> str:
@@ -532,27 +690,57 @@ class Transcriber:
             self._load_fw()
         elif self.backend == "whisper":
             self._load_ow()
+        elif self.backend == "parakeet-mlx":
+            self._load_pk()
+        elif self.backend == "mlx-whisper":
+            pass          # loads and caches on first transcribe
 
     def _load_fw(self):
         if self._model is None:
             from faster_whisper import WhisperModel
-            self._model = WhisperModel(self.model_name or "base.en",
+            self._model = WhisperModel(self.model_name or "small.en",
                                        device="auto", compute_type="int8")
         return self._model
 
     def _load_ow(self):
         if self._model is None:
             import whisper
-            self._model = whisper.load_model(self.model_name or "base.en")
+            self._model = whisper.load_model(self.model_name or "small.en")
+        return self._model
+
+    def _load_pk(self):
+        if self._model is None:
+            from parakeet_mlx import from_pretrained
+            self._model = from_pretrained(self.model_name or self.PARAKEET_DEFAULT)
         return self._model
 
     def transcribe(self, wav_path: str) -> str:
+        t0 = time.time()
+        text = self._transcribe(wav_path)
+        if TRACE:
+            TRACE("recognise", f"{self.backend}"
+                               f"{' ' + self.model_name if self.model_name else ''}"
+                               f" took {time.time() - t0:.1f}s"
+                               f"{' (biased)' if self.bias else ''}")
+            TRACE("  text", repr(text))
+        return text
+
+    def _transcribe(self, wav_path: str) -> str:
         b = self.backend
         if b == "faster-whisper":
             segs, _ = self._load_fw().transcribe(
                 wav_path, language=self.language, vad_filter=True,
-                beam_size=1, condition_on_previous_text=False)
+                beam_size=self.beam, initial_prompt=self.bias,
+                condition_on_previous_text=False)
             return "".join(s.text for s in segs).strip()
+        if b == "parakeet-mlx":
+            return self._load_pk().transcribe(wav_path).text.strip()
+        if b == "mlx-whisper":
+            import mlx_whisper
+            r = mlx_whisper.transcribe(
+                wav_path, path_or_hf_repo=self.model_name or self.MLX_DEFAULT,
+                language=self.language, initial_prompt=self.bias)
+            return str(r.get("text", "")).strip()
         if b == "whisper":
             r = self._load_ow().transcribe(wav_path, language=self.language,
                                            fp16=False)
@@ -586,7 +774,16 @@ class Session:
                                enabled=not args.no_speak)
         self.recorder = Recorder(threshold=args.mic_threshold,
                                  device=args.mic_device)
-        self.stt = Transcriber(args.stt, args.stt_model, args.language)
+        self.stt = Transcriber(args.stt, args.stt_model, args.language,
+                               beam=args.beam)
+
+        prof = agent_profile(argv)
+        from_config = getattr(args, "_config_keys", set())
+        for key, value in prof.items():
+            if not _flag_given(CONFIG_KEYS.get(key, (f"--{key.replace('_', '-')}",))) \
+                    and key not in from_config:
+                setattr(self.a, key, value)
+        self.profile = prof
 
         self.master_fd = -1
         self.pid = -1
@@ -629,6 +826,8 @@ class Session:
 
     def send(self, text: str, submit: bool = True) -> None:
         """Type `text` into the child agent as if the user had typed it."""
+        TRACE("inject", f"typing {text!r}"
+                        f"{' + enter' if submit else ''} into the agent")
         with self.lock:
             self.screen.mark(text)
             write_all(self.master_fd, text.encode())
@@ -860,10 +1059,24 @@ class Session:
         if now - self.started_at < self.a.startup_grace:
             return False
         low = self.recent_text()[-800:].lower()
-        busy = any(m in low for m in BUSY_MARKERS)
-        # if the last thing drawn still says "esc to interrupt" the agent may be
-        # mid-task but silent (a long tool call), so hold off much longer
-        return now - self.last_output >= (self.a.busy_idle if busy else self.a.idle)
+        quiet = now - self.last_output
+        if self.screen.at_prompt():
+            # Its input prompt is on screen, so it is waiting on us - this
+            # outranks the interrupt hint, which lingers in the same burst of
+            # output the agent used to erase it. Checking busy first made it
+            # sit out the full busy timeout after every single task.
+            need, why = self.a.prompt_idle, "input prompt visible"
+        elif any(m in low for m in BUSY_MARKERS):
+            # no prompt, but still showing an interrupt hint: probably mid-task
+            # and silent inside a long tool call, so hold off much longer
+            need, why = self.a.busy_idle, "interrupt hint, no prompt"
+        else:
+            need = self.a.idle
+            why = "output quiet"
+        ready = quiet >= need
+        if TRACE and ready:
+            TRACE("idle", f"{why}: quiet {quiet:.1f}s >= {need}s -> speak")
+        return ready
 
     def _drain(self) -> None:
         """Flush whatever the agent wrote just before it exited."""
@@ -908,9 +1121,10 @@ class Session:
 
         try:
             tty.setraw(0)
-            status(f"{GRN}voicepilot on{RST} - {' '.join(self.argv)}  "
+            tuned = " tuned" if self.profile else ""
+            status(f"{GRN}{self.a.name} on{RST} - {' '.join(self.argv)}  "
                    f"{DIM}[tts:{self.speaker.backend} stt:{self.stt.backend} "
-                   f"idle:{self.a.idle}s] Ctrl-] talk, Ctrl-\\ toggle{RST}")
+                   f"idle:{self.a.idle}s{tuned}] Ctrl-] talk, Ctrl-\\ toggle{RST}")
             while self.alive:
                 if self.winch:
                     self.winch = False
@@ -986,6 +1200,33 @@ APP_ALIASES = {
     "explorer": "explorer", "file explorer": "explorer",
     "notepad": "notepad", "task manager": "taskmgr", "edge": "msedge",
 }
+
+# overrides where the launcher name differs from the macOS application name
+APP_ALIASES_OS = {
+    "win": {
+        "chrome": "chrome", "google chrome": "chrome", "firefox": "firefox",
+        "vs code": "code", "vscode": "code", "code": "code",
+        "terminal": "wt", "settings": "ms-settings:",
+        "system settings": "ms-settings:", "system preferences": "ms-settings:",
+        "spotify": "spotify", "slack": "slack", "discord": "discord",
+        "notion": "notion", "zoom": "zoom", "edge": "msedge",
+        "mail": "outlookmail:", "calendar": "outlookcal:", "notes": "notepad",
+        "finder": "explorer", "preview": "photos:", "app store": "ms-windows-store:",
+    },
+    "linux": {
+        "chrome": "google-chrome", "google chrome": "google-chrome",
+        "firefox": "firefox", "vs code": "code", "vscode": "code", "code": "code",
+        "terminal": "x-terminal-emulator", "finder": "nautilus",
+        "files": "nautilus", "settings": "gnome-control-center",
+        "system settings": "gnome-control-center", "spotify": "spotify",
+        "slack": "slack", "discord": "discord", "calendar": "gnome-calendar",
+    },
+}
+
+# Windows virtual-key codes, for the chords SendKeys cannot express
+VK = {"win": 0x5B, "alt": 0x12, "ctrl": 0x11, "shift": 0x10, "tab": 0x09,
+      "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+      "f4": 0x73, "f11": 0x7A, "d": 0x44}
 
 MAC_KEYCODES = {
     "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51,
@@ -1087,6 +1328,22 @@ class Desktop:
     def _osa_str(text: str) -> str:
         return text.replace("\\", "\\\\").replace('"', '\\"')
 
+    def _app(self, name: str) -> str:
+        """Resolve a spoken app name to what this OS actually launches."""
+        key = name.lower().strip()
+        return (APP_ALIASES_OS.get(self.os, {}).get(key)
+                or APP_ALIASES.get(key)
+                or name.strip())
+
+    def _win_chord(self, *keys: str) -> None:
+        """Hold modifiers, tap the key, release. SendKeys cannot do Win+ or
+        Alt+Tab, so those have to go through the raw key event API."""
+        codes = [VK[k] for k in keys]
+        for c in codes:
+            self.u32.keybd_event(c, 0, 0, 0)
+        for c in reversed(codes):
+            self.u32.keybd_event(c, 0, 2, 0)
+
     def _xdo(self, *args: str) -> None:
         if not shutil.which("xdotool"):
             raise DesktopError("xdotool is not installed (sudo apt install xdotool)")
@@ -1095,7 +1352,7 @@ class Desktop:
     # -- apps -------------------------------------------------------------
 
     def open_app(self, name: str) -> str:
-        app = APP_ALIASES.get(name.lower().strip(), name.strip())
+        app = self._app(name)
         if self.os == "mac":
             self._sh(["open", "-a", app])
         elif self.os == "win":
@@ -1110,7 +1367,7 @@ class Desktop:
         return f"Opening {app}"
 
     def quit_app(self, name: str) -> str:
-        app = APP_ALIASES.get(name.lower().strip(), name.strip())
+        app = self._app(name)
         if self.os == "mac":
             self._osa(f'quit app "{self._osa_str(app)}"')
         elif self.os == "win":
@@ -1341,8 +1598,199 @@ class Desktop:
                       ".CopyFromScreen($b.Location,[Drawing.Point]::Empty,$b.Size);"
                       f"$i.Save('{path}')"])
         else:
-            self._sh(["import", "-window", "root", path])
-        return f"Screenshot saved to the desktop"
+            for tool in (["gnome-screenshot", "-f", path], ["scrot", path],
+                         ["spectacle", "-b", "-n", "-o", path],
+                         ["import", "-window", "root", path]):
+                if shutil.which(tool[0]):
+                    self._sh(tool)
+                    break
+            else:
+                raise DesktopError("no screenshot tool found "
+                                   "(install gnome-screenshot or scrot)")
+        return "Screenshot saved to the desktop"
+
+    # -- windows ----------------------------------------------------------
+
+    def focus_app(self, name: str) -> str:
+        app = self._app(name)
+        if self.os == "mac":
+            self._osa(f'tell application "{self._osa_str(app)}" to activate')
+        elif self.os == "win":
+            self._sh(["powershell", "-NoProfile", "-Command",
+                      "(New-Object -ComObject WScript.Shell)"
+                      f".AppActivate('{app}')"])
+        else:
+            self._sh(["wmctrl", "-a", app])
+        return f"Switched to {app}"
+
+    def window(self, action: str) -> str:
+        if self.os == "mac":
+            moves = {
+                "minimize": ("m", ("command",)),
+                "close": ("w", ("command",)),
+                "fullscreen": ("f", ("control", "command")),
+                "switch": ("tab", ("command",)),
+                "next window": ("`", ("command",)),
+            }
+            if action == "maximize":       # green-button zoom has no shortcut
+                self._osa('tell application "System Events" to tell '
+                          '(first process whose frontmost is true) to '
+                          'set value of attribute "AXFullScreen" of front window to true')
+                return "Maximized"
+            key, mods = moves[action]
+            self.press(key, mods)
+        elif self.os == "win":
+            chords = {"minimize": ("win", "down"), "maximize": ("win", "up"),
+                      "fullscreen": ("f11",), "close": ("alt", "f4"),
+                      "switch": ("alt", "tab"), "next window": ("alt", "tab")}
+            self._win_chord(*chords[action])
+        else:
+            keys = {"minimize": "super+h", "maximize": "super+Up",
+                    "fullscreen": "F11", "close": "alt+F4",
+                    "switch": "alt+Tab", "next window": "alt+grave"}
+            self._xdo("key", "--clearmodifiers", keys[action])
+        return action.capitalize()
+
+    # -- media / display --------------------------------------------------
+
+    def media(self, action: str) -> str:
+        """play-pause / next / previous."""
+        if self.os == "mac":
+            # macOS exposes no generic media key over AppleScript, so drive
+            # whichever player is actually running
+            verb = {"play": "playpause", "next": "next track",
+                    "previous": "previous track"}[action]
+            for app in ("Spotify", "Music"):
+                probe = subprocess.run(
+                    ["osascript", "-e",
+                     f'tell application "System Events" to (name of processes) '
+                     f'contains "{app}"'], capture_output=True, text=True)
+                if probe.stdout.strip() == "true":
+                    self._osa(f'tell application "{app}" to {verb}')
+                    return f"{action.capitalize()} in {app}"
+            raise DesktopError("no music player is running")
+        vk = {"play": 0xB3, "next": 0xB0, "previous": 0xB1}[action]
+        if self.os == "win":
+            self.u32.keybd_event(vk, 0, 0, 0)
+            self.u32.keybd_event(vk, 0, 2, 0)
+        else:
+            self._sh(["playerctl", {"play": "play-pause", "next": "next",
+                                    "previous": "previous"}[action]])
+        return action.capitalize()
+
+    def brightness(self, direction: str) -> str:
+        if self.os == "mac":
+            # F14/F15 are the brightness keys; not wired on every machine
+            self._osa("tell application \"System Events\" to key code "
+                      + ("144" if direction == "up" else "145"))
+        elif self.os == "win":
+            raise DesktopError("brightness control is not available on Windows here")
+        else:
+            self._sh(["brightnessctl", "set",
+                      "10%+" if direction == "up" else "10%-"])
+        return f"Brightness {direction}"
+
+    def sleep_display(self) -> str:
+        if self.os == "mac":
+            self._sh(["pmset", "displaysleepnow"])
+        elif self.os == "win":
+            self._sh(["powershell", "-NoProfile", "-Command",
+                      "(Add-Type '[DllImport(\"user32.dll\")]public static extern "
+                      "int SendMessage(int hWnd,int hMsg,int wParam,int lParam);' "
+                      "-Name W -PassThru)::SendMessage(-1,0x0112,0xF170,2)"])
+        else:
+            self._sh(["xset", "dpms", "force", "off"])
+        return "Turning the display off"
+
+    # -- clipboard / files ------------------------------------------------
+
+    def clipboard_get(self) -> str:
+        if self.os == "mac":
+            r = subprocess.run(["pbpaste"], capture_output=True, text=True)
+        elif self.os == "win":
+            r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                "Get-Clipboard"], capture_output=True, text=True)
+        else:
+            r = subprocess.run(["xclip", "-o", "-selection", "clipboard"],
+                               capture_output=True, text=True)
+        return r.stdout.strip()
+
+    def clipboard_set(self, text: str) -> str:
+        if self.os == "mac":
+            cmd = ["pbcopy"]
+        elif self.os == "win":
+            cmd = ["clip"]
+        else:
+            cmd = ["xclip", "-selection", "clipboard"]
+        subprocess.run(cmd, input=text, text=True)
+        return "Copied to the clipboard"
+
+    def open_path(self, where: str) -> str:
+        spoken = where.lower().strip().rstrip(".")
+        folders = {"downloads": "~/Downloads", "documents": "~/Documents",
+                   "desktop": "~/Desktop", "home": "~", "pictures": "~/Pictures",
+                   "music": "~/Music", "movies": "~/Movies",
+                   "applications": "/Applications", "trash": "~/.Trash"}
+        target = os.path.expanduser(folders.get(spoken, where))
+        if not os.path.exists(target):
+            raise DesktopError(f"there is no {where} folder")
+        if self.os == "mac":
+            self._sh(["open", target])
+        elif self.os == "win":
+            self._sh(["explorer", target])
+        else:
+            self._sh(["xdg-open", target])
+        return f"Opening {spoken}"
+
+    def open_url(self, url: str) -> str:
+        url = url.strip().replace(" dot ", ".").replace(" ", "")
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        if self.os == "mac":
+            self._sh(["open", url])
+        elif self.os == "win":
+            self._sh(["powershell", "-NoProfile", "-Command", f"Start-Process '{url}'"])
+        else:
+            self._sh(["xdg-open", url])
+        return f"Opening {url}"
+
+    # -- drag -------------------------------------------------------------
+
+    def drag_to(self, x: int, y: int) -> str:
+        sx, sy = self.cursor_pos()
+        if self.os == "mac":
+            lib, CGPoint = self.cg
+            for kind, point in ((1, CGPoint(sx, sy)),      # left down
+                                (6, CGPoint(x, y)),        # left dragged
+                                (2, CGPoint(x, y))):       # left up
+                ev = lib.CGEventCreateMouseEvent(None, kind, point, 0)
+                lib.CGEventPost(0, ev)
+                lib.CFRelease(ev)
+                time.sleep(0.05)
+        elif self.os == "win":
+            self.u32.mouse_event(0x0002, 0, 0, 0, 0)
+            self.move_to(x, y)
+            self.u32.mouse_event(0x0004, 0, 0, 0, 0)
+        else:
+            self._xdo("mousedown", "1")
+            self.move_to(x, y)
+            self._xdo("mouseup", "1")
+        return f"Dragged to {x}, {y}"
+
+    def power(self, action: str) -> str:
+        if self.os == "mac":
+            verb = {"shutdown": "shut down", "restart": "restart",
+                    "logout": "log out"}[action]
+            self._osa(f'tell application "System Events" to {verb}')
+        elif self.os == "win":
+            flag = {"shutdown": "/s", "restart": "/r", "logout": "/l"}[action]
+            self._sh(["shutdown", flag, "/t", "0"])
+        else:
+            cmd = {"shutdown": ["systemctl", "poweroff"],
+                   "restart": ["systemctl", "reboot"],
+                   "logout": ["loginctl", "terminate-user", os.getlogin()]}[action]
+            self._sh(cmd)
+        return f"{action.capitalize()} now"
 
     def accessibility_ok(self):
         """True/False on macOS, None where the question doesn't apply.
@@ -1418,13 +1866,33 @@ def _parse_keys(spec: str) -> tuple:
     return " ".join(key), tuple(mods)
 
 
+def command_vocabulary(wake: str = "") -> str:
+    """A decoder hint listing the words solo mode actually expects.
+
+    Only appropriate for a closed command set - in agent mode you dictate
+    arbitrary prose, and biasing toward this list would corrupt it.
+    """
+    verbs = ("open, launch, quit, switch to, click, double click, right click, "
+             "scroll up, scroll down, move the cursor, left, right, up, down, "
+             "center, type, press, command, shift, control, option, copy, "
+             "paste, undo, select all, close tab, screenshot, clipboard, "
+             "brightness, volume, mute, minimize, maximize, full screen, play, "
+             "next track, drag, downloads, documents, lock the screen, "
+             "start dictating, wake up, go to sleep")
+    apps = ", ".join(sorted({v for v in APP_ALIASES.values()})[:12])
+    head = f"{wake.capitalize()}. " if wake else ""
+    return f"{head}Commands: {verbs}. Apps: {apps}."
+
+
 class SoloSession:
     """voicepilot with no agent attached: plain voice control of the machine."""
 
-    HELP = ("Say things like: open Safari. move the cursor left 200. click. "
-            "double click. scroll down. type hello there. press command s. "
-            "copy. paste. volume up. take a screenshot. search for pasta "
-            "recipes. go to sleep. or, quit voicepilot.")
+    HELP = ("Say things like: open Safari. switch to Chrome. open downloads. "
+            "go to github dot com. move the cursor left 200. click. scroll "
+            "down. type hello there. press command s. copy. read the "
+            "clipboard. minimize. full screen. play. next track. volume up. "
+            "brightness down. take a screenshot. start dictating. lock the "
+            "screen. go to sleep. or, quit voicepilot.")
 
     def __init__(self, args):
         self.a = args
@@ -1432,14 +1900,18 @@ class SoloSession:
                                enabled=not args.no_speak)
         self.recorder = Recorder(threshold=args.mic_threshold,
                                  device=args.mic_device)
-        self.stt = Transcriber(args.stt, args.stt_model, args.language)
         self.desk = Desktop()
         # None means "not specified" -> use the assistant's name;
         # "" means --no-wake was passed on purpose, so leave it off
         wake = args.wake if args.wake is not None else args.name
         self.wake = re.sub(r"[^a-z ]", "", wake.lower()).strip()
+        self.stt = Transcriber(
+            args.stt, args.stt_model, args.language, beam=args.beam,
+            bias=None if args.no_bias else command_vocabulary(self.wake))
         self.awake = True
         self.running = True
+        self.dictating = False
+        self.pending = None        # (description, action) awaiting a spoken yes
         self.rules = self._build_rules()
 
     # -- vocabulary -------------------------------------------------------
@@ -1489,6 +1961,46 @@ class SoloSession:
             (r"^(?:press|hit|tap) (.+)$",
              lambda m: d.press(*_parse_keys(m.group(1)))),
 
+            (r"^(?:switch to|focus|go to app|bring up) (.+)$",
+             lambda m: d.focus_app(m.group(1))),
+            (r"^minimi[sz]e(?: the)?(?: window)?$", lambda m: d.window("minimize")),
+            (r"^maximi[sz]e(?: the)?(?: window)?$", lambda m: d.window("maximize")),
+            (r"^(?:go )?full ?screen$", lambda m: d.window("fullscreen")),
+            (r"^close(?: the)? window$", lambda m: d.window("close")),
+            (r"^(?:switch|next)(?: the)? window$|^switch apps?$",
+             lambda m: d.window("switch")),
+
+            (r"^(?:play|pause|play pause|resume music)$", lambda m: d.media("play")),
+            (r"^(?:next|skip)(?: the)? (?:track|song)$", lambda m: d.media("next")),
+            (r"^(?:previous|last|go back a)(?: the)? (?:track|song)$",
+             lambda m: d.media("previous")),
+            (r"^brightness (up|down)$|^(?:turn )?(?:the )?brightness (up|down)$",
+             lambda m: d.brightness(m.group(1) or m.group(2))),
+            (r"^(?:turn off|sleep)(?: the)? (?:display|screen|monitor)$",
+             lambda m: d.sleep_display()),
+
+            (r"^(?:read|what(?:'s| is) (?:on|in))(?: the)? clipboard$",
+             lambda m: self._read_clipboard()),
+            (r"^(?:open|show)(?: the)? (downloads|documents|desktop|home|"
+             r"pictures|music|movies|applications|trash)(?: folder)?$",
+             lambda m: d.open_path(m.group(1))),
+            (r"^(?:go to|open|visit) ([\w-]+(?: dot |\.)[\w.]+(?:/\S*)?)$",
+             lambda m: d.open_url(m.group(1))),
+
+            (r"^drag(?: the mouse)?(?: to)? (\d+)[ ,and]+(\d+)$",
+             lambda m: d.drag_to(int(m.group(1)), int(m.group(2)))),
+
+            (r"^(?:start|begin) (?:dictating|dictation|typing)$|^dictation mode$",
+             self._start_dictation),
+            (r"^(?:shut ?down|power off)(?: the)?(?: computer|machine|mac|pc)?$",
+             lambda m: self._confirm("Shut down the computer",
+                                     lambda: d.power("shutdown"))),
+            (r"^(?:restart|reboot)(?: the)?(?: computer|machine|mac|pc)?$",
+             lambda m: self._confirm("Restart the computer",
+                                     lambda: d.power("restart"))),
+            (r"^log ?out$|^sign out$",
+             lambda m: self._confirm("Log out", lambda: d.power("logout"))),
+
             (r"^(?:google|search for|search|look up) (.+)$",
              lambda m: d.web_search(m.group(1))),
             (r"^(?:open|launch|start|run) (?:the )?(?:app )?(.+)$",
@@ -1499,6 +2011,59 @@ class SoloSession:
             (r"^what(?:'s| is)? the time$|^what time is it$",
              lambda m: "It is " + time.strftime("%-I:%M %p")),
         ]
+
+    def _read_clipboard(self) -> str:
+        text = self.desk.clipboard_get()
+        if not text:
+            return "The clipboard is empty."
+        head, rest = speakable(text, self.a.reply_chars)
+        return f"The clipboard says: {head}" + (" And there is more." if rest else "")
+
+    def _start_dictation(self, m) -> str:
+        self.dictating = True
+        return "Dictation on. Everything you say gets typed. Say stop dictating to finish."
+
+    DICTATION_OFF = ("stop dictating", "stop dictation", "end dictation",
+                     "stop typing", "that's all", "thats all")
+
+    def _dictate(self, heard: str) -> None:
+        norm = re.sub(r"[^a-z' ]", "", heard.lower()).strip()
+        if norm in self.DICTATION_OFF:
+            self.dictating = False
+            status(f"{YEL}dictation off{RST}")
+            self.speaker.say("Dictation off.")
+            return
+        try:
+            if norm in ("new line", "newline"):
+                self.desk.press("return")
+            elif norm == "new paragraph":
+                self.desk.press("return")
+                self.desk.press("return")
+            else:
+                status(f'{DIM}typing:{RST} "{heard}"')
+                self.desk.type_text(heard)
+        except DesktopError as e:
+            status(f"{RED}{e}{RST}")
+            self.dictating = False
+            self.speaker.say("I can't type. Dictation off.")
+
+    def _resolve_pending(self, command: str) -> None:
+        description, action = self.pending
+        self.pending = None
+        if re.match(r"^(yes|yeah|yep|confirm|do it|go ahead|affirmative)$", command):
+            try:
+                reply = action()
+            except DesktopError as e:
+                reply = f"That failed. {e}"
+        else:
+            reply = f"Cancelled. Not doing it."
+        status(f"{GRN}{reply}{RST}")
+        self.speaker.say(reply)
+
+    def _confirm(self, description: str, action) -> str:
+        """Park a destructive action until it is confirmed out loud."""
+        self.pending = (description, action)
+        return f"{description}? Say yes to confirm."
 
     def _shortcut(self, name: str, shift: bool = False,
                   say: str | None = None) -> str:
@@ -1541,6 +2106,7 @@ class SoloSession:
             m = re.match(pattern, command)
             if not m:
                 continue
+            TRACE("match", f"{command!r} -> /{pattern[:48]}/")
             try:
                 reply = handler(m)
             except DesktopError as e:
@@ -1558,6 +2124,8 @@ class SoloSession:
             status(f"{GRN}{reply}{RST}")
             self.speaker.say(reply)
             return
+        TRACE("match", f"no rule matches {command!r} "
+                       f"({len(self.rules)} tried)")
         status(f'{YEL}no command matches{RST} "{command}"')
         self.speaker.say("I didn't understand that. Say help for a list.")
 
@@ -1593,6 +2161,12 @@ class SoloSession:
                 if not heard:
                     continue
 
+                # dictation takes the raw transcript, punctuation and all,
+                # and needs no wake word or it would be unusable
+                if self.dictating:
+                    self._dictate(heard)
+                    continue
+
                 command = self._addressed(heard)
                 if command is None:
                     status(f'{DIM}not addressed to me: "{heard}"{RST}')
@@ -1601,6 +2175,10 @@ class SoloSession:
                 if self.a.log:
                     with open(self.a.log, "a") as f:
                         f.write(f"{time.strftime('%F %T')}\tsolo\t{heard}\n")
+
+                if self.pending:
+                    self._resolve_pending(command)
+                    continue
 
                 if not self.awake:
                     # asleep: nothing but the wake command gets through
@@ -1616,6 +2194,61 @@ class SoloSession:
 
 
 # --------------------------------------------------------------- self check --
+
+def run_compare(args) -> int:
+    """Record one phrase and show what every installed engine makes of it.
+
+    Synthetic audio can't rank these - every engine transcribes clean
+    text-to-speech near perfectly. Only your own voice, microphone and room
+    tell you which one is actually better for you.
+    """
+    if not Recorder.available():
+        print("Needs a microphone: pip install sounddevice numpy", file=sys.stderr)
+        return 2
+    backends = Transcriber.available_backends()
+    if not backends:
+        print("No speech engines installed: pip install faster-whisper",
+              file=sys.stderr)
+        return 2
+
+    trials = []
+    for b in backends:
+        if b == "faster-whisper":
+            trials += [(f"faster-whisper {m}", b, m)
+                       for m in ("base.en", "small.en", "medium.en")]
+        else:
+            trials.append((b, b, None))
+
+    print("Engines to try: " + ", ".join(label for label, _, _ in trials))
+    print(f"{DIM}Models download on first use (medium.en is ~770MB), so the "
+          f"first run of this can be slow.{RST}\n")
+    rec = Recorder(threshold=args.mic_threshold, device=args.mic_device)
+    print("Say a command that usually gets misheard - speak, then pause.")
+    wav = rec.record(max_wait=20.0, silence=args.silence,
+                     max_len=args.max_utterance)
+    if not wav:
+        print("Heard nothing. Try --mic-threshold 400.")
+        return 1
+
+    bias = None if args.no_bias else command_vocabulary(args.wake or "")
+    print(f"\n{'engine':30} {'time':>6}  transcript")
+    print("-" * 76)
+    for label, backend, model in trials:
+        try:
+            t = Transcriber(backend, model, args.language, beam=args.beam,
+                            bias=bias)
+            t.warm()
+            t0 = time.time()
+            text = t.transcribe(wav)
+            print(f"{label:30} {time.time() - t0:5.1f}s  {text!r}")
+        except Exception as e:
+            print(f"{label:30}    --   failed: {type(e).__name__}: {e}")
+    os.unlink(wav)
+    print("\nPick whichever got it right and save it, for example:")
+    print("  voicepilot --stt parakeet-mlx --save")
+    print("  voicepilot --stt faster-whisper --stt-model medium.en --save")
+    return 0
+
 
 def run_check(args) -> int:
     ok = True
@@ -1664,8 +2297,13 @@ def run_check(args) -> int:
             ok = False
             print(f"   -> could not open the mic: {e}")
 
-    st = Transcriber(args.stt, args.stt_model, args.language)
-    print(f"speech-to-text : {st.backend}")
+    st = Transcriber(args.stt, args.stt_model, args.language, beam=args.beam)
+    installed = Transcriber.available_backends()
+    print(f"speech-to-text : {st.backend}"
+          f"{' ' + (args.stt_model or '') if args.stt_model else ''}"
+          f"   (installed: {', '.join(installed) or 'none'})")
+    if len(installed) > 1:
+        print("   -> run 'voicepilot --compare' to test them on your own voice")
     if not st.available:
         ok = False
         print("   -> pip install faster-whisper      (local, recommended)")
@@ -1730,8 +2368,17 @@ def build_parser() -> argparse.ArgumentParser:
                "  voicepilot.py solo --no-wake\n"
                "  voicepilot.py --check             verify mic / TTS / STT\n",
     )
+    p.add_argument("--version", action="version",
+                   version=f"voicepilot {__version__}")
     p.add_argument("--check", action="store_true",
                    help="verify mic / TTS / STT and exit")
+    p.add_argument("--trace", action="store_true",
+                   help="print the decisions it makes as it makes them "
+                        "(to stderr, so: --trace claude 2> trace.log)")
+    p.add_argument("--compare", action="store_true",
+                   help="record one phrase and transcribe it with every "
+                        "installed engine, so you can pick the best for your "
+                        "voice and microphone")
 
     g = p.add_argument_group("identity")
     g.add_argument("--name", default="Pilot", metavar="NAME",
@@ -1761,6 +2408,9 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("detection")
     g.add_argument("--idle", type=float, default=2.5, metavar="SEC",
                    help="seconds of silent output that mean 'task done' (2.5)")
+    g.add_argument("--prompt-idle", type=float, default=0.8, metavar="SEC",
+                   help="idle needed when the agent's input prompt is visible, "
+                        "which proves it is waiting (0.8)")
     g.add_argument("--busy-idle", type=float, default=15.0, metavar="SEC",
                    help="idle needed when the screen still shows a working/"
                         "interrupt hint, i.e. a silent long tool call (15)")
@@ -1794,10 +2444,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-speak", action="store_true",
                    help="show prompts on screen but stay silent")
     g.add_argument("--stt", default="auto",
-                   choices=["auto", "faster-whisper", "whisper", "openai",
-                            "google", "none"])
+                   choices=["auto", "faster-whisper", "parakeet-mlx",
+                            "mlx-whisper", "whisper", "openai", "google", "none"])
     g.add_argument("--stt-model", default=None,
-                   help="whisper model, e.g. base.en / small.en / whisper-1")
+                   help="model for the chosen engine, e.g. small.en / "
+                        "medium.en / large-v3 (bigger is more accurate, slower)")
+    g.add_argument("--beam", type=int, default=5, metavar="N",
+                   help="whisper beam width; 1 is fastest, 5 is more accurate (5)")
+    g.add_argument("--no-bias", action="store_true",
+                   help="don't hint the decoder with the solo command vocabulary")
     g.add_argument("--language", default="en", help="spoken language (en)")
     g.add_argument("--no-warm", dest="warm", action="store_false",
                    help="don't preload the speech model at startup")
@@ -1836,9 +2491,11 @@ def main() -> int:
     args = p.parse_args()
 
     cfg = load_config()
+    args._config_keys = set()
     for key, flags in CONFIG_KEYS.items():
         if key in cfg and not _flag_given(flags):
             setattr(args, key, cfg[key])
+            args._config_keys.add(key)
     # renaming the assistant renames what you call it by, otherwise a saved
     # wake word would silently outlive the name it came from
     if _flag_given(CONFIG_KEYS["name"]) and not _flag_given(CONFIG_KEYS["wake"]):
@@ -1850,6 +2507,13 @@ def main() -> int:
         if not args.command and not args.solo and not args.check:
             return 0          # "just remember this" is a complete request
 
+    enable_windows_ansi()
+
+    global TRACE
+    TRACE = Trace(args.trace)
+
+    if args.compare:
+        return run_compare(args)
     if args.check:
         return run_check(args)
 

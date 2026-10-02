@@ -8,11 +8,20 @@ cd "$HERE"
 
 case "$(uname -s)" in
   Darwin|Linux) ;;
-  *) echo "voicepilot needs a Unix pty (it uses pty/termios/fcntl)."
-     echo "On Windows, run it inside WSL."; exit 1 ;;
+  MINGW*|MSYS*|CYGWIN*)
+     # a Unix-ish shell on Windows: the venv layout here is Scripts\, not bin/,
+     # so this script would build something that cannot run
+     echo "This is a Windows shell. Use the PowerShell installer instead:"
+     echo ""
+     echo "    powershell -ExecutionPolicy Bypass -File install.ps1"
+     echo ""
+     echo "That sets up solo mode (voice control of the machine)."
+     echo "Wrapping an AI agent needs a Unix pty - install under WSL for that."
+     exit 1 ;;
+  *) echo "Unsupported platform: $(uname -s)"; exit 1 ;;
 esac
 
-# 1. pick an interpreter 
+# --- 1. pick an interpreter -------------------------------------------------
 # Newest is not safest: compiled deps (ctranslate2) lag behind new releases.
 PY=""
 for v in 3.12 3.13 3.11 3.10; do
@@ -26,7 +35,7 @@ if [ -z "$PY" ]; then
 fi
 echo "==> interpreter: $PY ($("$PY" -V 2>&1))"
 
-# 2. build the venv
+# --- 2. build the venv ------------------------------------------------------
 rm -rf .venv
 if command -v uv >/dev/null 2>&1; then
   echo "==> creating .venv with uv"
@@ -39,7 +48,25 @@ else
   ./.venv/bin/python -m pip install -r requirements.txt
 fi
 
-# 3. make the script self-contained
+# --- 2b. optional Apple Silicon speech engines -----------------------------
+# Much better English recognition, but parakeet pulls torch (~2GB), so it is
+# opt-in rather than part of the default install.
+if [ "${1:-}" = "--mlx" ]; then
+  if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    echo "==> installing parakeet-mlx + mlx-whisper (large download)"
+    if command -v uv >/dev/null 2>&1; then
+      uv pip install --python .venv/bin/python parakeet-mlx mlx-whisper
+    else
+      ./.venv/bin/python -m pip install parakeet-mlx mlx-whisper
+    fi
+  else
+    echo "==> --mlx needs Apple Silicon; skipping"
+  fi
+elif [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+  echo "==> tip: ./install.sh --mlx adds faster, more accurate speech engines"
+fi
+
+# --- 3. make the script self-contained -------------------------------------
 # -i.bak keeps this working on both BSD sed (macOS) and GNU sed (Linux)
 sed -i.bak "1s|.*|#!$HERE/.venv/bin/python|" voicepilot.py
 rm -f voicepilot.py.bak
@@ -53,7 +80,7 @@ case ":$PATH:" in
   *) echo "    (add to your shell rc:  export PATH=\"\$HOME/.local/bin:\$PATH\")" ;;
 esac
 
-# 4. platform bits the pip deps can't provide
+# --- 4. platform bits the pip deps can't provide ---------------------------
 if [ "$(uname -s)" = "Linux" ]; then
   command -v espeak-ng >/dev/null 2>&1 || command -v spd-say >/dev/null 2>&1 || {
     echo "==> no speech synthesiser found, install one:"
