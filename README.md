@@ -15,6 +15,22 @@ still type whenever you want. voicepilot only watches the output stream.
 Everything runs locally. No API keys, and after the first run no internet —
 your voice never leaves the machine.
 
+## Architecture
+
+voicepilot is a single Python program (`voicepilot.py`) made of a few small parts:
+
+| Component | Role |
+|---|---|
+| `Recorder` | Records from the default microphone (`sounddevice`) and stops automatically on silence (RMS threshold with `numpy`) |
+| `Transcriber` | Local speech-to-text: faster-whisper by default, parakeet-mlx or mlx-whisper on Apple Silicon, optional cloud engines |
+| `Session` | Runs the agent inside a pseudo-terminal (`pty` on macOS/Linux, `pywinpty`/ConPTY on Windows), types dictated prompts in and watches the output stream |
+| `Screen` | Reassembles the agent's output and isolates its last reply; full-screen repaints (e.g. Codex) are reconstructed with `pyte` |
+| `Speaker` | Text-to-speech using what the OS already has (`say` on macOS, espeak-ng on Linux), with `pyttsx3` as a fallback |
+| `SoloSession` / `Desktop` | Solo mode: voice control of the computer without an agent |
+| `Trace` | Optional live commentary on its decisions, written to stderr (`voicepilot --trace claude 2> trace.log`) |
+
+**Tech:** Python · faster-whisper · sounddevice · numpy · pty / pywinpty (ConPTY) · pyte · macOS, Linux and Windows
+
 ## Quick start
 
 ```bash
